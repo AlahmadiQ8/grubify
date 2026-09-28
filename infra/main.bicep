@@ -29,6 +29,105 @@ resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   tags: tags
 }
 
+// ──────────────────────────────────────────────
+// Monitoring
+// ──────────────────────────────────────────────
+
+// Log Analytics Workspace
+module logAnalyticsWorkspace 'core/monitor/log-analytics-workspace.bicep' = {
+  name: 'log-analytics-workspace'
+  scope: rg
+  params: {
+    name: 'law-${resourceToken}'
+    location: location
+    tags: tags
+  }
+}
+
+// Application Insights
+module applicationInsights 'core/monitor/application-insights.bicep' = {
+  name: 'application-insights'
+  scope: rg
+  params: {
+    name: '${abbrs.insightsComponents}${resourceToken}'
+    location: location
+    tags: tags
+    logAnalyticsWorkspaceId: logAnalyticsWorkspace.outputs.id
+  }
+}
+
+// Action Group for alerts
+module actionGroup 'core/monitor/action-group.bicep' = {
+  name: 'action-group'
+  scope: rg
+  params: {
+    name: '${abbrs.insightsActionGroups}${resourceToken}'
+    tags: tags
+    groupShortName: 'SRELabAG'
+  }
+}
+
+// HTTP 5xx metric alert on the API container app
+module http5xxAlert 'core/monitor/metric-alert.bicep' = {
+  name: 'http-5xx-alert'
+  scope: rg
+  params: {
+    name: 'alert-http-5xx-${resourceToken}'
+    tags: tags
+    severity: 3
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    scopes: [
+      api.outputs.id
+    ]
+    actionGroupIds: [
+      actionGroup.outputs.id
+    ]
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          criterionType: 'StaticThresholdCriterion'
+          name: 'http5xx'
+          metricNamespace: 'microsoft.app/containerapps'
+          metricName: 'Requests'
+          operator: 'GreaterThan'
+          threshold: 5
+          timeAggregation: 'Total'
+          dimensions: [
+            {
+              name: 'statusCodeCategory'
+              operator: 'Include'
+              values: [
+                '5xx'
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+
+// ──────────────────────────────────────────────
+// Identity
+// ──────────────────────────────────────────────
+
+// User-Assigned Managed Identity (used by SRE Agent / operational tooling)
+module sreIdentity 'core/identity/user-assigned-identity.bicep' = {
+  name: 'sre-identity'
+  scope: rg
+  params: {
+    name: '${abbrs.managedIdentityUserAssignedIdentities}sre-${resourceToken}'
+    location: location
+    tags: tags
+  }
+}
+
+// ──────────────────────────────────────────────
+// Hosting
+// ──────────────────────────────────────────────
+
 // Container registry
 module containerRegistry 'core/host/container-registry.bicep' = {
   name: 'container-registry'
@@ -48,6 +147,7 @@ module containerAppsEnvironment 'core/host/container-apps-environment.bicep' = {
     name: '${abbrs.appManagedEnvironments}${resourceToken}'
     location: location
     tags: tags
+    logAnalyticsWorkspaceName: logAnalyticsWorkspace.outputs.name
   }
 }
 
@@ -65,9 +165,13 @@ module api 'core/host/container-app.bicep' = {
     containerImage: !empty(apiImage) ? apiImage : 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
     targetPort: 8080
     external: true
-    minReplicas: 1  // Always keep 1 instance running
-    maxReplicas: 1  // No autoscaling - single instance only
+    minReplicas: 1
+    maxReplicas: 5
     env: [
+      {
+        name: 'ASPNETCORE_URLS'
+        value: 'http://+:8080'
+      }
       {
         name: 'ASPNETCORE_ENVIRONMENT'
         value: 'Production'
@@ -94,8 +198,10 @@ module frontend 'core/host/container-app.bicep' = {
     containerImage: !empty(frontendImage) ? frontendImage : 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
     targetPort: 80
     external: true
-    minReplicas: 1  // Always keep 1 instance running
-    maxReplicas: 1  // No autoscaling - single instance only
+    cpu: '0.25'
+    memory: '0.5Gi'
+    minReplicas: 1
+    maxReplicas: 3
     env: [
       {
         name: 'REACT_APP_API_BASE_URL'
@@ -105,7 +211,10 @@ module frontend 'core/host/container-app.bicep' = {
   }
 }
 
-// App outputs
+// ──────────────────────────────────────────────
+// Outputs
+// ──────────────────────────────────────────────
+
 output AZURE_LOCATION string = location
 output AZURE_TENANT_ID string = tenant().tenantId
 output AZURE_RESOURCE_GROUP string = rg.name
@@ -113,6 +222,10 @@ output RESOURCE_GROUP_ID string = rg.id
 
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = containerRegistry.outputs.loginServer
 output AZURE_CONTAINER_REGISTRY_NAME string = containerRegistry.outputs.name
+
+output LOG_ANALYTICS_WORKSPACE_NAME string = logAnalyticsWorkspace.outputs.name
+output APPLICATION_INSIGHTS_NAME string = applicationInsights.outputs.name
+output SRE_IDENTITY_CLIENT_ID string = sreIdentity.outputs.clientId
 
 output API_BASE_URL string = 'https://${api.outputs.fqdn}'
 output FRONTEND_URL string = 'https://${frontend.outputs.fqdn}'
